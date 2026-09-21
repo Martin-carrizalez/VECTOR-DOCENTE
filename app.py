@@ -30,6 +30,20 @@ FUNCIONES_MEJOREDU = {
     "R": "Reconoce la trascendencia de su función social a través del fortalecimiento de su identidad profesional como actor autónomo, corresponsable y ético.",
 }
 
+# Etiqueta breve de cada función para mostrar en pantalla sin ocupar un párrafo.
+FUNCIONES_MEJOREDU_CORTO = {
+    "F": "Favorece el desarrollo integral",
+    "G": "Gestiona el aprendizaje",
+    "C": "Colabora y establece alianzas",
+    "I": "Innova su práctica",
+    "R": "Reconoce su función social",
+}
+
+def etiqueta_funcion(comp_key):
+    """Texto 'Función X · nombre corto' de una competencia de la rúbrica."""
+    f = RUBRICA_DATA[comp_key]["funcion_mejoredu"]
+    return f"Función {f} · {FUNCIONES_MEJOREDU_CORTO[f]}"
+
 # Campos por competencia:
 #   funcion_mejoredu -> clave de FUNCIONES_MEJOREDU (correspondencia PROPUESTA,
 #                       pendiente de validación por el área académica).
@@ -983,6 +997,57 @@ def crear_objeto_recomendacion(curso, score, scores_docente, insights_contexto, 
     }
      
 # ---- VISUALIZACIONES ----
+def mostrar_lectura_mejoredu(scores):
+    """
+    Reagrupa las 10 competencias de la rúbrica en las 5 funciones del marco
+    MEJOREDU (F, G, C, I, R). Es la vista que permite leer el resultado de la
+    app en el mismo idioma que el Diagnóstico de Necesidades de Formación.
+    """
+    st.subheader("🧭 Tu autopercepción leída desde el Marco de referencia MEJOREDU")
+    st.caption("Las 10 competencias de este autodiagnóstico se agrupan en las 5 funciones "
+               "del marco que utiliza el Diagnóstico de Necesidades de Formación estatal. "
+               "La correspondencia es una propuesta sujeta a validación académica.")
+
+    niveles = ["Inicial", "En Desarrollo", "Consolidado", "Destacado"]
+    filas = []
+    for f, corto in FUNCIONES_MEJOREDU_CORTO.items():
+        comps = [c for c in COMPETENCIAS_EVALUADAS if RUBRICA_DATA[c]["funcion_mejoredu"] == f]
+        if not comps:
+            # Una función sin competencias es un hueco de cobertura del instrumento.
+            filas.append({"Función": f"{f} · {corto}", "Nivel promedio declarado": None,
+                          "Competencias que la cubren": "— sin cobertura —",
+                          "Admiten 2ª fuente": "0 de 0"})
+            continue
+        vals = [scores[COMPETENCIAS_EVALUADAS.index(c)] for c in comps]
+        filas.append({
+            "Función": f"{f} · {corto}",
+            "Nivel promedio declarado": round(sum(vals) / len(vals), 2),
+            "Competencias que la cubren": ", ".join(
+                f"{RUBRICA_DATA[c]['titulo']} ({niveles[int(scores[COMPETENCIAS_EVALUADAS.index(c)]) - 1]})"
+                for c in comps),
+            "Admiten 2ª fuente": f"{sum(RUBRICA_DATA[c]['observable'] for c in comps)} de {len(comps)}",
+        })
+    df = pd.DataFrame(filas)
+
+    graf = df.dropna(subset=["Nivel promedio declarado"])
+    fig = px.bar(graf, x="Función", y="Nivel promedio declarado",
+                 text="Nivel promedio declarado",
+                 title="Nivel promedio declarado por función del marco")
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=420, yaxis=dict(range=[0, 4.5], title="Nivel declarado (1–4)"),
+                      xaxis_title=None)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # Funciones con una sola competencia: su promedio depende de una respuesta.
+    delgadas = [f"{f} · {corto}" for f, corto in FUNCIONES_MEJOREDU_CORTO.items()
+                if sum(RUBRICA_DATA[c]["funcion_mejoredu"] == f for c in COMPETENCIAS_EVALUADAS) == 1]
+    if delgadas:
+        st.warning("⚠️ " + "; ".join(delgadas) + " — se estima con una sola competencia "
+                   "de la rúbrica, por lo que su lectura es menos robusta que la del resto.")
+
+
 def mostrar_radar_competencias(scores):
     """Muestra un gráfico radar del perfil de competencias"""
     competencias_labels = [RUBRICA_DATA[comp]["titulo"].replace(".", "").strip() for comp in COMPETENCIAS_EVALUADAS]
@@ -1153,8 +1218,9 @@ def show_recommendations_page_diversificada():
             st.rerun()
         return
     
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab_mej, tab2, tab3, tab4 = st.tabs([
         "🎯 Recomendaciones",
+        "🧭 Marco MEJOREDU",
         "📈 Tu autopercepción", 
         "📊 Análisis de Diversificación",
         "👨‍🏫 Contexto"
@@ -1196,7 +1262,8 @@ def show_recommendations_page_diversificada():
                 # Competencia principal
                 comp_principal = curso.get('competencia_principal', 'N/A')
                 if comp_principal != 'Desarrollo integral':
-                    st.info(f"🎯 **Competencia principal que desarrolla:** {RUBRICA_DATA.get(comp_principal, {}).get('titulo', comp_principal)}")
+                    st.info(f"🎯 **Competencia principal que desarrolla:** {RUBRICA_DATA.get(comp_principal, {}).get('titulo', comp_principal)}"
+                            f"  \n🧭 **Marco MEJOREDU:** {etiqueta_funcion(comp_principal)}")
                 
                 st.write("**📝 Descripción:**")
                 st.write(curso.get('descripcion', 'N/A'))
@@ -1204,6 +1271,10 @@ def show_recommendations_page_diversificada():
                 justificacion = curso.get('justificacion', 'Complementa tu perfil actual.')
                 st.success(f"💡 **¿Por qué este curso?** {justificacion}")
     
+    with tab_mej:
+        if scores:
+            mostrar_lectura_mejoredu(scores)
+
     with tab2:
         if scores:
             st.subheader("📊 Visualización de tu autopercepción")
@@ -1262,6 +1333,8 @@ def show_diagnostic_page_con_contexto():
             for key in competencias_col1:
                 value = RUBRICA_DATA[key]
                 st.subheader(value["titulo"])
+                # Correspondencia con el marco que usa el DNF estatal.
+                st.caption(f"🧭 Marco MEJOREDU — {etiqueta_funcion(key)}")
                 responses[key] = st.radio(
                     "Selecciona tu nivel:",
                     options=value["descriptores"],
@@ -1274,6 +1347,8 @@ def show_diagnostic_page_con_contexto():
             for key in competencias_col2:
                 value = RUBRICA_DATA[key]
                 st.subheader(value["titulo"])
+                # Correspondencia con el marco que usa el DNF estatal.
+                st.caption(f"🧭 Marco MEJOREDU — {etiqueta_funcion(key)}")
                 responses[key] = st.radio(
                     "Selecciona tu nivel:",
                     options=value["descriptores"],

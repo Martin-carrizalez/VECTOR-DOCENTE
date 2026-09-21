@@ -18,6 +18,26 @@ st.set_page_config(page_title="VECTOR DOCENTE", layout="wide")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Funciones del Marco de Referencia de Saberes y Conocimientos Docentes
+# (MEJOREDU), tal como se aplican en el DNF de Jalisco. Cada competencia de la
+# rúbrica declara a cuál corresponde, para que los resultados de esta app puedan
+# cruzarse con el diagnóstico estatal en lugar de vivir en una taxonomía aparte.
+FUNCIONES_MEJOREDU = {
+    "F": "Favorece el desarrollo integral de niñas, niños y adolescentes conforme al marco normativo, bajo el enfoque de equidad, inclusión e interculturalidad.",
+    "G": "Gestiona el aprendizaje a través de procesos de enseñanza organizados y sistemáticos, con estrategias y situaciones didácticas contextualizadas.",
+    "C": "Colabora y establece alianzas con actores internos y externos para la mejora de los procesos institucionales y de la práctica profesional.",
+    "I": "Innova permanentemente su práctica docente como resultado del análisis reflexivo y crítico de su hacer profesional.",
+    "R": "Reconoce la trascendencia de su función social a través del fortalecimiento de su identidad profesional como actor autónomo, corresponsable y ético.",
+}
+
+# Campos por competencia:
+#   funcion_mejoredu -> clave de FUNCIONES_MEJOREDU (correspondencia PROPUESTA,
+#                       pendiente de validación por el área académica).
+#   observable       -> True si la competencia admite una segunda fuente además
+#                       de la autopercepción (observación de aula, evidencia
+#                       documental, registro administrativo). Si es False, esta
+#                       competencia NUNCA podrá triangularse y su resultado se
+#                       queda siempre en percepción declarada.
 RUBRICA_DATA = {
     "dominio_curricular": {
         "titulo": "1. Dominio Curricular y Pedagógico",
@@ -27,7 +47,9 @@ RUBRICA_DATA = {
             "Consolidado: Tomo decisiones pedagógicas fundamentadas para contextualizar la currícula, articulando los ejes, campos formativos y contenidos de manera coherente en mi planeación.",
             "Destacado: Lidero el codiseño curricular en mi colectivo, generando propuestas que articulan el Plan de Estudio 2022 con el proyecto escolar."
         ],
-        "tags": "currículo, Plan de Estudio 2022, Nueva Escuela Mexicana, pedagogía, contextualización"
+        "tags": "currículo, Plan de Estudio 2022, Nueva Escuela Mexicana, pedagogía, contextualización",
+        "funcion_mejoredu": "G",
+        "observable": True,  # planeación didáctica entregable
     },
     "reflexion_practica": {
         "titulo": "2. Reflexión y Transformación de la Práctica",
@@ -37,7 +59,9 @@ RUBRICA_DATA = {
             "Consolidado: Utilizo de manera sistemática herramientas de reflexión (como bitácoras) para analizar mi práctica y ajustar mis estrategias.",
             "Destacado: Promuevo activamente la reflexión colectiva. Sistematizo y comparto los hallazgos de mi práctica para transformar el quehacer docente del colectivo."
         ],
-        "tags": "reflexión, práctica docente, transformación, saberes docentes, problematización, autoanálisis, mejora"
+        "tags": "reflexión, práctica docente, transformación, saberes docentes, problematización, autoanálisis, mejora",
+        "funcion_mejoredu": "I",
+        "observable": False,  # solo autorreporte: no hay artefacto externo
     },
     "colaboracion_dialogo": {
         "titulo": "3. Colaboración y Diálogo Profesional",
@@ -47,7 +71,9 @@ RUBRICA_DATA = {
             "Consolidado: Colaboro activamente en el diseño y ejecución de proyectos colectivos en el CTE, utilizando el diálogo para construir acuerdos.",
             "Destacado: Impulso y lidero comunidades de aprendizaje profesional, creando una cultura de confianza y colaboración."
         ],
-        "tags": "colaboración, diálogo, trabajo en equipo, comunidades de aprendizaje, corresponsabilidad"
+        "tags": "colaboración, diálogo, trabajo en equipo, comunidades de aprendizaje, corresponsabilidad",
+        "funcion_mejoredu": "C",
+        "observable": True,  # actas y productos del colectivo
     },
     "liderazgo_autonomia": {
         "titulo": "4. Liderazgo y Autonomía Profesional",
@@ -57,7 +83,9 @@ RUBRICA_DATA = {
             "Consolidado: Ejerzo mi autonomía profesional para tomar decisiones curriculares y de gestión que se alinean con el proyecto escolar.",
             "Destacado: Asumo un rol de liderazgo pedagógico, inspirando y coordinando acciones para la mejora continua y fomentando la autonomía de mis colegas."
         ],
-        "tags": "autonomía, liderazgo, toma de decisiones, responsabilidad, función directiva"
+        "tags": "autonomía, liderazgo, toma de decisiones, responsabilidad, función directiva",
+        "funcion_mejoredu": "R",
+        "observable": False,  # solo autorreporte
     },
     "evaluacion_aprendizaje": {
         "titulo": "5. Evaluación para el Aprendizaje",
@@ -67,7 +95,9 @@ RUBRICA_DATA = {
             "Consolidado: Implemento de forma sistemática la autoevaluación y coevaluación, y ofrezco retroalimentación descriptiva que ayuda a mejorar.",
             "Destacado: He logrado que mis estudiantes se apropien del proceso evaluativo, utilizando la autoevaluación para autorregular su aprendizaje."
         ],
-        "tags": "evaluación formativa, retroalimentación, autoevaluación, coevaluación, mejora del aprendizaje, enseñanza"
+        "tags": "evaluación formativa, retroalimentación, autoevaluación, coevaluación, mejora del aprendizaje, enseñanza",
+        "funcion_mejoredu": "G",
+        "observable": True,  # instrumentos de evaluación del docente
     },
     "atencion_diversidad": {
         "titulo": "6. Atención a la Diversidad e Inclusión",
@@ -77,7 +107,9 @@ RUBRICA_DATA = {
             "Consolidado: Diseño e implemento de manera consistente planeaciones diversificadas y ajustes razonables para todos mis estudiantes.",
             "Destacado: Promuevo activamente una cultura de aula incluyente e intercultural, donde la diversidad es reconocida como una fortaleza."
         ],
-        "tags": "diversidad, inclusión, equidad, empatía, respeto, derechos humanos, vulnerabilidad"
+        "tags": "diversidad, inclusión, equidad, empatía, respeto, derechos humanos, vulnerabilidad",
+        "funcion_mejoredu": "F",
+        "observable": True,  # observable en aula
     },
     "gestion_recursos_tic": {
         "titulo": "7. Gestión de Recursos y Tecnologías",
@@ -87,7 +119,9 @@ RUBRICA_DATA = {
             "Consolidado: Integro intencionadamente recursos tecnológicos en mi planeación para que los estudiantes investiguen, creen y colaboren.",
             "Destacado: Diseño experiencias de aprendizaje donde la tecnología es un mediador pedagógico clave y gestiono creativamente los recursos."
         ],
-        "tags": "TIC, tecnología educativa, recursos didácticos, herramientas digitales, plataformas, materiales"
+        "tags": "TIC, tecnología educativa, recursos didácticos, herramientas digitales, plataformas, materiales",
+        "funcion_mejoredu": "G",
+        "observable": True,  # observable en aula
     },
     "gestion_desarrollo_profesional": {
         "titulo": "8. Gestión del Desarrollo Profesional Continuo",
@@ -97,7 +131,9 @@ RUBRICA_DATA = {
             "Consolidado: Identifico de forma autónoma mis necesidades de formación y participo en trayectos que promueven la reflexión.",
             "Destacado: Lidero el diagnóstico de necesidades formativas en mi colectivo y promuevo la participación en trayectos de desarrollo."
         ],
-        "tags": "formación continua, desarrollo profesional, necesidades formativas, planificación, monitoreo, evaluación de programas"
+        "tags": "formación continua, desarrollo profesional, necesidades formativas, planificación, monitoreo, evaluación de programas",
+        "funcion_mejoredu": "R",
+        "observable": True,  # verificable contra el registro de acreditación
     },
     "adaptabilidad_resolucion": {
         "titulo": "9. Adaptabilidad y Resolución de Problemas",
@@ -107,7 +143,9 @@ RUBRICA_DATA = {
             "Consolidado: Abordo los desafíos de la práctica con una metodología clara, analizando causas y efectos para proponer soluciones.",
             "Destacado: Demuestro una visión estratégica para anticipar y resolver problemas complejos, transformando desafíos en oportunidades."
         ],
-        "tags": "adaptabilidad, flexibilidad, resolución de problemas, gestión del cambio, retos, desafíos"
+        "tags": "adaptabilidad, flexibilidad, resolución de problemas, gestión del cambio, retos, desafíos",
+        "funcion_mejoredu": "F",
+        "observable": False,  # correspondencia más débil del crosswalk: revisar con el área académica
     },
     "documentacion_sistematizacion": {
         "titulo": "10. Documentación y Sistematización",
@@ -117,7 +155,9 @@ RUBRICA_DATA = {
             "Consolidado: Documento de forma sistemática mis planeaciones, proyectos y reflexiones, creando un portafolio profesional.",
             "Destacado: Impulso la cultura de la documentación y sistematización en mi colectivo, generando evidencia para la toma de decisiones."
         ],
-        "tags": "documentación, sistematización, registro, evidencia, informes"
+        "tags": "documentación, sistematización, registro, evidencia, informes",
+        "funcion_mejoredu": "I",
+        "observable": True,  # evidencia documental
     }
 }
 
@@ -129,7 +169,7 @@ def load_model():
     """Carga y cachea el modelo de IA para evitar recargas innecesarias"""
     try:
         logger.info("Cargando modelo SentenceTransformer...")
-        model = SentenceTransformer('all-MiniLM-L6-v2')
+        model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
         logger.info("Modelo cargado exitosamente")
         return model
     except Exception as e:
@@ -165,13 +205,10 @@ def extraer_insights_contexto(contexto_personal, model):
         if matches:
             insights[categoria] = matches
     
-    # Calcular embedding del contexto para análisis semántico
-    try:
-        contexto_embedding = model.encode([contexto_personal])[0]
-        insights['embedding_contexto'] = contexto_embedding
-    except Exception as e:
-        logger.error(f"Error al generar embedding del contexto: {e}")
-        insights['embedding_contexto'] = None
+    # El embedding del contexto se calculaba aquí y no lo leía ninguna función:
+    # el análisis del contexto es, hoy, coincidencia de palabras clave. Se deja
+    # la clave en None para no romper consumidores y se evita el encode inútil.
+    insights['embedding_contexto'] = None
     
     return insights
 
@@ -229,6 +266,7 @@ def inicializar_base_de_datos():
         {columnas_sql},
         fecha_evaluacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         contexto_personal TEXT DEFAULT '',
+        fuente TEXT DEFAULT 'autopercepcion',  -- autopercepcion | observacion | evidencia_producto
         FOREIGN KEY (id_docente) REFERENCES Docentes (id_docente)
     );''')
     
@@ -600,6 +638,16 @@ def actualizar_base_de_datos_contexto():
         except sqlite3.Error as e:
             logger.error(f"Error al agregar columna: {e}")
     
+    if 'fuente' not in columns:
+        try:
+            cursor.execute("""
+                ALTER TABLE Evaluaciones 
+                ADD COLUMN fuente TEXT DEFAULT 'autopercepcion'
+            """)
+            logger.info("Columna fuente agregada exitosamente")
+        except sqlite3.Error as e:
+            logger.error(f"Error al agregar columna fuente: {e}")
+    
     # También agregar a tabla Docentes para persistencia
     cursor.execute("PRAGMA table_info(Docentes)")
     columns = [column[1] for column in cursor.fetchall()]
@@ -617,117 +665,10 @@ def actualizar_base_de_datos_contexto():
     conn.commit()
     conn.close()
 
-# ========== FUNCIÓN MEJORADA PARA GENERAR PERFIL CON CONTEXTO ==========
-def generar_prompt_perfil_con_contexto(scores, contexto_personal=""):
-    """Genera un prompt enriquecido que incluye el contexto personal del docente"""
-    niveles = ["Muy bajo", "Bajo", "Medio", "Alto"]
-    
-    # Identificar fortalezas y debilidades
-    fortalezas = []
-    debilidades = []
-    competencias_medias = []
-    
-    for i, (comp, score) in enumerate(zip(COMPETENCIAS_EVALUADAS, scores)):
-        nivel = niveles[int(score)-1]
-        comp_titulo = RUBRICA_DATA[comp]["titulo"]
-        
-        if score >= 3.5:
-            fortalezas.append(f"{comp_titulo} ({nivel})")
-        elif score <= 2:
-            debilidades.append(f"{comp_titulo} ({nivel})")
-        else:
-            competencias_medias.append(f"{comp_titulo} ({nivel})")
-    
-    # Crear prompt estructurado y enriquecido
-    prompt_parts = [
-        "=== PERFIL DOCENTE PARA RECOMENDACIÓN DE CURSOS ===",
-        ""
-    ]
-    
-    # SECCIÓN 1: CONTEXTO PERSONAL (NUEVO)
-    if contexto_personal and contexto_personal.strip():
-        prompt_parts.extend([
-            "📝 CONTEXTO PERSONAL Y PRÁCTICA ACTUAL:",
-            f"'{contexto_personal.strip()}'",
-            ""
-        ])
-    
-    # SECCIÓN 2: ANÁLISIS DE COMPETENCIAS
-    prompt_parts.extend([
-        "📊 ANÁLISIS DE COMPETENCIAS:",
-        f"💪 FORTALEZAS IDENTIFICADAS: {', '.join(fortalezas) if fortalezas else 'En desarrollo general'}",
-        f"🎯 ÁREAS PRIORITARIAS DE MEJORA: {', '.join(debilidades) if debilidades else 'Perfil equilibrado'}",
-        f"⚖️ COMPETENCIAS EN DESARROLLO: {', '.join(competencias_medias) if competencias_medias else 'Ninguna'}",
-        ""
-    ])
-    
-    # SECCIÓN 3: PERFIL DETALLADO POR COMPETENCIA
-    prompt_parts.append("🔍 PERFIL DETALLADO POR COMPETENCIA:")
-    for comp, score in zip(COMPETENCIAS_EVALUADAS, scores):
-        nivel = niveles[int(score)-1]
-        tags = ', '.join(RUBRICA_DATA[comp]["tags"])
-        descriptor = RUBRICA_DATA[comp]["descriptores"][int(score)-1]
-        prompt_parts.append(
-            f"• {comp.replace('_', ' ').title()}: {nivel} (Puntuación: {score}/4) "
-            f"- {descriptor} [Tags: {tags}]"
-        )
-    
-    # SECCIÓN 4: RESUMEN ESTADÍSTICO
-    promedio = np.mean(scores)
-    desviacion = np.std(scores)
-    prompt_parts.extend([
-        "",
-        "📈 RESUMEN ESTADÍSTICO:",
-        f"• Promedio general: {promedio:.2f}/4",
-        f"• Variabilidad del perfil: {desviacion:.2f}",
-        f"• Fortalezas identificadas: {len(fortalezas)}",
-        f"• Áreas de mejora prioritarias: {len(debilidades)}"
-    ])
-    
-    return "\n".join(prompt_parts)
-
-# ========== JUSTIFICACIÓN MEJORADA CON CONTEXTO ==========
-def generar_justificacion_con_contexto(curso_data, scores, insights_contexto):
-    """Genera justificación personalizada considerando contexto personal"""
-    justificaciones = []
-    
-    # Justificación por competencias (original)
-    competencias_curso = curso_data.get('competencias_clave', '').split(',')
-    debilidades = []
-    
-    for i, (comp, score) in enumerate(zip(COMPETENCIAS_EVALUADAS, scores)):
-        if score <= 2 and comp in competencias_curso:
-            debilidades.append(RUBRICA_DATA[comp]["titulo"])
-    
-    if debilidades:
-        justificaciones.append(f"Fortalecerá tus áreas de mejora en: {', '.join(debilidades)}")
-    
-    # Justificación por contexto personal
-    if insights_contexto:
-        # Modalidad
-        if 'modalidad' in insights_contexto:
-            modalidad_curso = curso_data.get('modalidad', '')
-            if any(mod in modalidad_curso.lower() for mod in insights_contexto['modalidad']):
-                justificaciones.append(f"Se adapta a tu preferencia por modalidad {modalidad_curso.lower()}")
-        
-        # Recursos tecnológicos
-        if 'recursos_tecnologicos' in insights_contexto and len(insights_contexto['recursos_tecnologicos']) > 0:
-            if curso_data.get('modalidad') in ['Virtual', 'Mixto']:
-                justificaciones.append("Aprovecha tu interés en tecnología educativa")
-        
-        # Desafíos mencionados
-        if 'desafios' in insights_contexto:
-            justificaciones.append("Aborda algunos de los desafíos que mencionaste en tu práctica")
-        
-        # Intereses específicos
-        if 'intereses' in insights_contexto:
-            justificaciones.append("Conecta con los intereses que expresaste")
-    
-    # Justificación por defecto si no hay específicas
-    if not justificaciones:
-        justificaciones.append("Complementa tu perfil profesional actual y te permitirá seguir creciendo")
-    
-    return " • ".join(justificaciones)
+# NOTA: aquí vivían generar_prompt_perfil_con_contexto y
+# generar_justificacion_con_contexto. Ninguna se llamaba desde ningún lado
+# (la ruta viva usa generar_perfil_focusado) y la primera hacía
+# ', '.join(tags) sobre un string, partiéndolo letra por letra.
 
 # ========== SISTEMA DE RECOMENDACIÓN DIVERSIFICADO ==========
 def recomendar_cursos_diversificado(id_docente, contexto_personal="", num_recomendaciones=5,
@@ -1052,7 +993,7 @@ def mostrar_radar_competencias(scores):
         r=scores,
         theta=competencias_labels,
         fill='toself',
-        name='Tu Perfil',
+        name='Autopercepción',
         line=dict(color='rgb(1, 87, 155)'),
         fillcolor='rgba(1, 87, 155, 0.25)'
     ))
@@ -1066,7 +1007,7 @@ def mostrar_radar_competencias(scores):
                 ticktext=["Inicial", "En Desarrollo", "Consolidado", "Destacado"]
             )),
         showlegend=True,
-        title="Tu Perfil de Competencias Docentes",
+        title="Tu autopercepción de desempeño docente",
         height=500
     )
     
@@ -1099,7 +1040,7 @@ def mostrar_analisis_competencias(scores):
             "Consolidado": "#44aa44",
             "Destacado": "#0088ff"
         },
-        title="Análisis Detallado por Competencia"
+        title="Análisis detallado por competencia (nivel declarado)"
     )
     
     fig.update_layout(
@@ -1133,7 +1074,7 @@ def mostrar_distribucion_niveles(scores):
     )])
     
     fig.update_layout(
-        title_text="Distribución de Competencias por Nivel de Dominio"
+        title_text="Distribución de competencias por nivel declarado"
     )
     return fig
 # ========== FUNCIÓN PARA MOSTRAR ANÁLISIS DE DIVERSIFICACIÓN ==========
@@ -1214,7 +1155,7 @@ def show_recommendations_page_diversificada():
     
     tab1, tab2, tab3, tab4 = st.tabs([
         "🎯 Recomendaciones",
-        "📈 Tu Perfil", 
+        "📈 Tu autopercepción", 
         "📊 Análisis de Diversificación",
         "👨‍🏫 Contexto"
     ])
@@ -1265,7 +1206,7 @@ def show_recommendations_page_diversificada():
     
     with tab2:
         if scores:
-            st.subheader("📊 Visualización de tu Perfil Docente")
+            st.subheader("📊 Visualización de tu autopercepción")
             
             radar_fig = mostrar_radar_competencias(scores)
             st.plotly_chart(radar_fig, use_container_width=True)
@@ -1310,7 +1251,7 @@ def show_diagnostic_page_con_contexto():
         responses = {}
         
         # Sección 1: Evaluación de competencias
-        st.subheader("📊 Evaluación de Competencias Docentes")
+        st.subheader("📊 Autodiagnóstico: retos de tu práctica docente")
         
         col1, col2 = st.columns(2)
         
@@ -1410,10 +1351,11 @@ Me gustaría aprender más sobre evaluación porque siento que solo califico ex�
                     placeholders = ', '.join(['?'] * len(COMPETENCIAS_EVALUADAS))
                     sql_insert = f"""
                         INSERT OR REPLACE INTO Evaluaciones 
-                        (id_docente, {column_names}, contexto_personal)
-                        VALUES (?, {placeholders}, ?)
+                        (id_docente, {column_names}, contexto_personal, fuente)
+                        VALUES (?, {placeholders}, ?, ?)
                     """
-                    cursor.execute(sql_insert, [id_demo] + scores + [contexto_personal])
+                    cursor.execute(sql_insert,
+                                   [id_demo] + scores + [contexto_personal, 'autopercepcion'])
                     
                     conn.commit()
                     conn.close()

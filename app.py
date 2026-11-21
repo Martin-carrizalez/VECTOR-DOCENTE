@@ -847,12 +847,13 @@ def texto_curso(curso):
     curso y nada más. Cualquier texto fijo que compartan todos los cursos los
     acerca entre sí en el espacio vectorial y borra justo lo que los distingue.
     """
-    nombre, horas, desc, comps, modalidad, nivel = curso[0], curso[1], curso[2], curso[3], curso[4], curso[5]
+    nombre, horas, desc = curso[0], curso[1], curso[2]
+    comps, modalidad, nivel = curso[3], curso[4], curso[5]
     tags = ", ".join(t for c in (comps or "").split(",")
                      if (t := RUBRICA_DATA.get(c.strip(), {}).get("tags", "")))
     return (f"{nombre}. {desc} "
             f"Aborda {tags}. "
-            f"Modalidad {modalidad}, {horas} horas.").strip()
+            f"Modalidad {modalidad}, nivel {nivel}, {horas} horas.").strip()
 
 
 def embeddings_catalogo(cursos):
@@ -2081,6 +2082,10 @@ cómo trabajar con alumnos que tienen barreras de aprendizaje en grupos grandes.
                                    [id_docente] + scores +
                                    [contexto_personal, 'autopercepcion',
                                     herramientas_deseadas, control_num, control_ok])
+                    # Se captura ANTES del commit: lastrowid pertenece al cursor
+                    # y se usa para ligar cada registro de brecha con el
+                    # autodiagnóstico exacto que lo originó.
+                    id_evaluacion = cursor.lastrowid
 
                     conn.commit()
                     conn.close()

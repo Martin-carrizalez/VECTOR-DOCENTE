@@ -8,6 +8,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
 import logging
+import re
+import hashlib
 import pandas as pd
 
 # ---- CONFIGURACIÓN ----
@@ -177,6 +179,41 @@ RUBRICA_DATA = {
 
 COMPETENCIAS_EVALUADAS = list(RUBRICA_DATA.keys())
 
+# ---- REACTIVO DE CONTROL DE LECTURA ----
+# Bloque con la misma apariencia que los 10 de la rúbrica, pero cuya respuesta
+# correcta está escrita en el propio enunciado. No bloquea el envío: solo
+# registra si la persona leyó. Marcar es mejor que bloquear, porque un filtro
+# mal calibrado descarta autodiagnósticos válidos.
+#
+# La opción correcta es la 2 y no la 4 a propósito: quien va marcando el nivel
+# más alto en todo (el patrón dominante cuando alguien se autocalifica) la falla.
+CONTROL_TITULO = "Reactivo de control del instrumento"
+CONTROL_OPCIONES = [
+    "Inicial: Reviso los contenidos del instrumento antes de responderlo.",
+    "En Desarrollo: Esta es la opción que pide este reactivo de control. Selecciónela.",
+    "Consolidado: Respondo los instrumentos institucionales de forma sistemática.",
+    "Destacado: Promuevo entre mis colegas el uso reflexivo de los instrumentos.",
+]
+CONTROL_CORRECTA = 2   # índice 1-based dentro de CONTROL_OPCIONES
+
+# Posición en la que se intercala dentro de la columna izquierda del formulario.
+# A media lista, que es donde cae la atención, no al inicio ni al final.
+CONTROL_POSICION = 3
+
+# ---- CATÁLOGOS DE SEGMENTACIÓN ----
+# Las categorías son LAS MISMAS que usa la Encuesta de aprendizajes y
+# satisfacción. Si se cambian aquí, los dos instrumentos dejan de poder
+# cruzarse y la brecha de oferta pierde su valor comparativo.
+NIVELES_EDUCATIVOS = [
+    "Educación Preescolar", "Educación Primaria", "Secundaria general",
+    "Secundaria técnica", "Telesecundaria", "Educación especial",
+    "Educación física", "Educación inicial", "Otro",
+]
+FUNCIONES_DOCENTES = [
+    "Docente", "Directiva", "Supervisión", "Asesoría técnica pedagógica", "Otra",
+]
+CONTEXTOS_ESCUELA = ["Urbano", "Rural"]
+
 # ---- CACHE DEL MODELO IA ----
 @st.cache_resource
 def load_model():
@@ -226,6 +263,40 @@ def extraer_insights_contexto(contexto_personal, model):
     
     return insights
 
+# ---- VALIDACIÓN DE CURP ----
+# El formato por expresión regular solo comprueba la forma. El dígito
+# verificador comprueba que la CURP exista como tal: una base de datos real da
+# ~100% de dígitos válidos y la captura manual da alrededor de 3% de erratas,
+# así que la diferencia sirve además como señal de calidad del dato.
+CURP_RE = re.compile(r"^[A-ZÑ]{4}\d{6}[HM][A-ZÑ]{5}[A-Z0-9]\d$")
+_CURP_DIC = "0123456789ABCDEFGHIJKLMNÑOPQRSTUVWXYZ"
+
+def digito_verificador_curp(curp):
+    """Devuelve el dígito de control que le corresponde a la CURP, o None."""
+    if not curp or len(curp) != 18:
+        return None
+    suma = 0
+    for i, ch in enumerate(curp[:17]):
+        pos = _CURP_DIC.find(ch)
+        if pos < 0:
+            return None
+        suma += pos * (18 - i)
+    return str((10 - (suma % 10)) % 10)
+
+def validar_curp(curp):
+    """(es_valida, mensaje). Acepta minúsculas y espacios: se normaliza antes."""
+    c = (curp or "").strip().upper().replace(" ", "")
+    if not c:
+        return False, "Escribe tu CURP."
+    if len(c) != 18:
+        return False, f"La CURP tiene 18 caracteres; escribiste {len(c)}."
+    if not CURP_RE.match(c):
+        return False, "El formato no corresponde a una CURP."
+    dv = digito_verificador_curp(c)
+    if dv is None or c[17] != dv:
+        return False, "El dígito verificador no coincide. Revisa si hay un carácter mal."
+    return True, c
+
 # ---- VALIDACIÓN DE DATOS ----
 def validar_datos_entrada(responses):
     """Valida que los datos de entrada sean correctos"""
@@ -253,12 +324,19 @@ def inicializar_base_de_datos():
     cursor = conn.cursor()
     
     # Tablas básicas
+    # curp es la llave real del docente: es la que permite unir este
+    # autodiagnóstico con el registro de acreditación y con la encuesta de
+    # satisfacción posterior, que es la única fuente de resultado que existe.
     cursor.execute('''CREATE TABLE IF NOT EXISTS Docentes (
-        id_docente INTEGER PRIMARY KEY,
+        id_docente INTEGER PRIMARY KEY AUTOINCREMENT,
+        curp TEXT UNIQUE,
         nombre_docente TEXT,
         perfil_simulado TEXT,
         fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        contexto_actual TEXT DEFAULT ''
+        contexto_actual TEXT DEFAULT '',
+        nivel_educativo TEXT,
+        funcion TEXT,
+        contexto TEXT
     );''')
     
     cursor.execute('''CREATE TABLE IF NOT EXISTS Cursos (
@@ -281,9 +359,48 @@ def inicializar_base_de_datos():
         fecha_evaluacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         contexto_personal TEXT DEFAULT '',
         fuente TEXT DEFAULT 'autopercepcion',  -- autopercepcion | observacion | evidencia_producto
+        herramientas_deseadas TEXT DEFAULT '',  -- qué pide aprender: demanda prospectiva
+        control_respuesta INTEGER,             -- opción marcada en el reactivo (1-4)
+        control_ok INTEGER,                    -- 1 si acertó, 0 si no, NULL si no aplicó
         FOREIGN KEY (id_docente) REFERENCES Docentes (id_docente)
     );''')
     
+    # ---- REGISTRO DE BRECHA DE OFERTA ----
+    # Cada renglón es una necesidad formativa detectada que el catálogo NO pudo
+    # atender. Es el insumo que convierte este recomendador en un instrumento de
+    # planeación: a los mil diagnósticos, agregado por nivel y función, dice qué
+    # cursos hay que diseñar, con evidencia y no por opinión del área.
+    cursor.execute('''CREATE TABLE IF NOT EXISTS BrechaOferta (
+        id_brecha INTEGER PRIMARY KEY AUTOINCREMENT,
+        id_docente INTEGER,
+        id_evaluacion INTEGER,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        competencia TEXT,            -- clave de RUBRICA_DATA
+        funcion_mejoredu TEXT,       -- F/G/C/I/R, para leerlo en el marco del DNF
+        nivel_declarado INTEGER,     -- 1-4 que se autoasignó el docente
+        nivel_educativo TEXT,
+        funcion TEXT,
+        contexto TEXT,
+        cubierta INTEGER,            -- 1 si el catálogo ofreció curso, 0 si no
+        motivo TEXT,                 -- por qué no se cubrió
+        control_ok INTEGER,          -- calidad del diagnóstico que originó el registro
+        FOREIGN KEY (id_docente) REFERENCES Docentes (id_docente)
+    );''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_brecha_comp ON BrechaOferta(competencia)")
+
+    # ---- CACHÉ DE EMBEDDINGS DEL CATÁLOGO ----
+    # El texto de un curso no cambia entre diagnósticos, así que vectorizarlo en
+    # cada recomendación es trabajo tirado: con mil docentes serían 83 mil encodes
+    # de 83 textos idénticos. Se guarda el vector y se recalcula solo si cambia
+    # el texto, detectado por hash.
+    cursor.execute('''CREATE TABLE IF NOT EXISTS CursoEmbedding (
+        clave_registrada TEXT PRIMARY KEY,
+        hash_texto TEXT,
+        vector BLOB,
+        dim INTEGER,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );''')
+
     # Cursos con datos mejorados
     cursos_a_insertar = [
     # DOMINIO CURRICULAR Y PEDAGÓGICO
@@ -661,6 +778,15 @@ def actualizar_base_de_datos_contexto():
             logger.info("Columna fuente agregada exitosamente")
         except sqlite3.Error as e:
             logger.error(f"Error al agregar columna fuente: {e}")
+
+    for col, tipo in (("control_respuesta", "INTEGER"), ("control_ok", "INTEGER"),
+                      ("herramientas_deseadas", "TEXT")):
+        if col not in columns:
+            try:
+                cursor.execute(f"ALTER TABLE Evaluaciones ADD COLUMN {col} {tipo}")
+                logger.info(f"Columna {col} agregada exitosamente")
+            except sqlite3.Error as e:
+                logger.error(f"Error al agregar columna {col}: {e}")
     
     # También agregar a tabla Docentes para persistencia
     cursor.execute("PRAGMA table_info(Docentes)")
@@ -675,9 +801,300 @@ def actualizar_base_de_datos_contexto():
             logger.info("Columna contexto_actual agregada a Docentes")
         except sqlite3.Error as e:
             logger.error(f"Error al agregar contexto_actual: {e}")
+
+    # En bases creadas antes de esta versión la CURP no existía. Se agrega sin
+    # UNIQUE porque SQLite no permite añadir una restricción UNIQUE con ALTER;
+    # la unicidad se garantiza en obtener_o_crear_docente, que consulta primero.
+    for col in ("nivel_educativo", "funcion", "contexto"):
+        if col not in columns:
+            try:
+                cursor.execute(f"ALTER TABLE Docentes ADD COLUMN {col} TEXT")
+                logger.info(f"Columna {col} agregada a Docentes")
+            except sqlite3.Error as e:
+                logger.error(f"Error al agregar {col}: {e}")
+
+    # La tabla de brecha puede no existir en bases creadas antes de esta versión.
+    cursor.execute('''CREATE TABLE IF NOT EXISTS BrechaOferta (
+        id_brecha INTEGER PRIMARY KEY AUTOINCREMENT,
+        id_docente INTEGER, id_evaluacion INTEGER,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        competencia TEXT, funcion_mejoredu TEXT, nivel_declarado INTEGER,
+        nivel_educativo TEXT, funcion TEXT, contexto TEXT,
+        cubierta INTEGER, motivo TEXT, control_ok INTEGER
+    );''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_brecha_comp ON BrechaOferta(competencia)")
+    cursor.execute('''CREATE TABLE IF NOT EXISTS CursoEmbedding (
+        clave_registrada TEXT PRIMARY KEY, hash_texto TEXT, vector BLOB, dim INTEGER,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );''')
+
+    if 'curp' not in columns:
+        try:
+            cursor.execute("ALTER TABLE Docentes ADD COLUMN curp TEXT")
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_docentes_curp "
+                           "ON Docentes(curp) WHERE curp IS NOT NULL")
+            logger.info("Columna curp agregada a Docentes")
+        except sqlite3.Error as e:
+            logger.error(f"Error al agregar curp: {e}")
     
     conn.commit()
     conn.close()
+
+def texto_curso(curso):
+    """Texto único que representa a un curso para vectorizarlo.
+
+    Sin encabezados de plantilla: lo que se vectoriza debe ser el contenido del
+    curso y nada más. Cualquier texto fijo que compartan todos los cursos los
+    acerca entre sí en el espacio vectorial y borra justo lo que los distingue.
+    """
+    nombre, horas, desc, comps, modalidad, nivel = curso[0], curso[1], curso[2], curso[3], curso[4], curso[5]
+    tags = ", ".join(t for c in (comps or "").split(",")
+                     if (t := RUBRICA_DATA.get(c.strip(), {}).get("tags", "")))
+    return (f"{nombre}. {desc} "
+            f"Aborda {tags}. "
+            f"Modalidad {modalidad}, {horas} horas.").strip()
+
+
+def embeddings_catalogo(cursos):
+    """Vectores de los cursos, leídos de caché y recalculados solo si cambiaron.
+
+    Devuelve un arreglo alineado con la lista `cursos` que recibe.
+    """
+    textos = [texto_curso(c) for c in cursos]
+    claves = [c[6] for c in cursos]
+    hashes = [hashlib.sha1(t.encode("utf-8")).hexdigest() for t in textos]
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        guardados = {k: (h, v, d) for k, h, v, d in cursor.execute(
+            "SELECT clave_registrada, hash_texto, vector, dim FROM CursoEmbedding")}
+        vectores, faltantes = [None] * len(cursos), []
+        for i, (k, h) in enumerate(zip(claves, hashes)):
+            g = guardados.get(k)
+            if g and g[0] == h and g[1]:
+                vectores[i] = np.frombuffer(g[1], dtype=np.float32)
+            else:
+                faltantes.append(i)
+
+        if faltantes:
+            logger.info(f"Vectorizando {len(faltantes)} curso(s); "
+                        f"{len(cursos)-len(faltantes)} salieron de caché")
+            nuevos = model.encode([textos[i] for i in faltantes])
+            filas = []
+            for j, i in enumerate(faltantes):
+                v = np.asarray(nuevos[j], dtype=np.float32)
+                vectores[i] = v
+                filas.append((claves[i], hashes[i], v.tobytes(), int(v.shape[0])))
+            cursor.executemany(
+                "INSERT OR REPLACE INTO CursoEmbedding "
+                "(clave_registrada, hash_texto, vector, dim) VALUES (?,?,?,?)", filas)
+            conn.commit()
+        else:
+            logger.info(f"{len(cursos)} curso(s) servidos desde caché, sin vectorizar")
+        return np.vstack(vectores)
+    finally:
+        conn.close()
+
+
+def obtener_o_crear_docente(curp, contexto="", nivel_educativo=None, funcion=None,
+                            contexto_escuela=None):
+    """Devuelve el id_docente de esa CURP, creándolo si es la primera vez.
+
+    La CURP es la llave: dos autodiagnósticos de la misma persona caen en el
+    mismo id_docente y quedan como dos renglones de Evaluaciones con fechas
+    distintas, que es lo que permite ver su trayectoria.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT id_docente FROM Docentes WHERE curp = ?", (curp,))
+        fila = cursor.fetchone()
+        if fila:
+            cursor.execute("""UPDATE Docentes SET contexto_actual = ?, nivel_educativo = ?,
+                              funcion = ?, contexto = ? WHERE id_docente = ?""",
+                           (contexto, nivel_educativo, funcion, contexto_escuela, fila[0]))
+            conn.commit()
+            return fila[0]
+        cursor.execute("""INSERT INTO Docentes (curp, nombre_docente, perfil_simulado,
+                          contexto_actual, nivel_educativo, funcion, contexto)
+                          VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                       (curp, f"Docente {curp[:4]}", "Autodiagnóstico", contexto,
+                        nivel_educativo, funcion, contexto_escuela))
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def registrar_brecha(id_docente, competencias_debiles, competencias_cubiertas,
+                     control_ok=None, id_evaluacion=None):
+    """Guarda qué necesidades formativas detectadas pudo y no pudo atender el catálogo.
+
+    Se escribe SIEMPRE, cubiertas y no cubiertas, para poder calcular la tasa de
+    cobertura. Sin las cubiertas el denominador no existe y el reporte diría
+    'faltan N cursos' sin decir de cuántos.
+    """
+    if not competencias_debiles:
+        return 0
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        seg = cursor.execute(
+            "SELECT nivel_educativo, funcion, contexto FROM Docentes WHERE id_docente = ?",
+            (id_docente,)).fetchone() or (None, None, None)
+        filas = []
+        for info in competencias_debiles:
+            comp = info["competencia"]
+            cubierta = 1 if comp in competencias_cubiertas else 0
+            # El motivo distingue las dos causas de no cobertura, que piden
+            # decisiones distintas: diseñar un curso nuevo, o ampliar el cupo
+            # y la modalidad de los que ya existen.
+            n_cursos = _cursos_para_competencia(cursor, comp)
+            motivo = None if cubierta else (
+                f"el catálogo casi no tiene oferta para esta competencia ({n_cursos})"
+                if n_cursos <= 2
+                else "hay cursos, pero ninguno quedó entre las recomendaciones")
+            filas.append((id_docente, id_evaluacion, comp,
+                          RUBRICA_DATA[comp]["funcion_mejoredu"], info["score"],
+                          seg[0], seg[1], seg[2], cubierta, motivo, control_ok))
+        cursor.executemany("""INSERT INTO BrechaOferta
+            (id_docente, id_evaluacion, competencia, funcion_mejoredu, nivel_declarado,
+             nivel_educativo, funcion, contexto, cubierta, motivo, control_ok)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""", filas)
+        conn.commit()
+        logger.info(f"Brecha registrada: {len(filas)} necesidades, "
+                    f"{sum(1 for f in filas if f[8]==0)} sin cubrir")
+        return len(filas)
+    except sqlite3.Error as e:
+        logger.error(f"Error al registrar brecha: {e}")
+        return 0
+    finally:
+        conn.close()
+
+
+def _cursos_para_competencia(cursor, competencia):
+    """Cuántos cursos del catálogo declaran esa competencia."""
+    return cursor.execute(
+        "SELECT COUNT(*) FROM Cursos WHERE competencias_clave LIKE ?",
+        (f"%{competencia}%",)).fetchone()[0]
+
+
+def resumen_brecha(solo_control_ok=False):
+    """Agregado por competencia: demanda detectada, cubierta y sin cubrir.
+
+    solo_control_ok limita el reporte a los diagnósticos que superaron el
+    reactivo de control, que es como debe presentarse a un área que va a tomar
+    decisiones de presupuesto con esto.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        filtro = " WHERE control_ok = 1" if solo_control_ok else ""
+        filas = conn.execute(f"""
+            SELECT competencia, funcion_mejoredu,
+                   COUNT(*) AS detectada,
+                   SUM(CASE WHEN cubierta = 0 THEN 1 ELSE 0 END) AS sin_cubrir,
+                   AVG(nivel_declarado) AS nivel_medio
+            FROM BrechaOferta{filtro}
+            GROUP BY competencia ORDER BY sin_cubrir DESC, detectada DESC""").fetchall()
+        cursor = conn.cursor()
+        return [dict(competencia=f[0], titulo=RUBRICA_DATA.get(f[0], {}).get("titulo", f[0]),
+                     funcion=f[1], detectada=f[2], sin_cubrir=f[3] or 0,
+                     nivel_medio=round(f[4] or 0, 2),
+                     cursos_catalogo=_cursos_para_competencia(cursor, f[0]))
+                for f in filas]
+    finally:
+        conn.close()
+
+
+def brecha_por_segmento(dimension="nivel_educativo", solo_control_ok=False):
+    """Matriz competencia x segmento con el conteo de necesidades sin cubrir.
+
+    Es la vista que responde la pregunta de planeación: qué hay que diseñar y
+    para quién. dimension debe ser una columna de BrechaOferta.
+    """
+    if dimension not in ("nivel_educativo", "funcion", "contexto"):
+        raise ValueError("dimensión no permitida")
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        filtro = " AND control_ok = 1" if solo_control_ok else ""
+        filas = conn.execute(f"""
+            SELECT competencia, {dimension}, COUNT(*)
+            FROM BrechaOferta
+            WHERE cubierta = 0 AND {dimension} IS NOT NULL{filtro}
+            GROUP BY competencia, {dimension}""").fetchall()
+        if not filas:
+            return pd.DataFrame()
+        d = pd.DataFrame(filas, columns=["competencia", dimension, "sin_cubrir"])
+        d["competencia"] = d["competencia"].map(
+            lambda c: RUBRICA_DATA.get(c, {}).get("titulo", c))
+        return d.pivot_table(index="competencia", columns=dimension,
+                             values="sin_cubrir", fill_value=0, aggfunc="sum")
+    finally:
+        conn.close()
+
+
+def demanda_declarada(dimension=None, solo_control_ok=False, min_menciones=3):
+    """Qué dicen los docentes que quieren aprender, agregado por términos.
+
+    Es la contraparte prospectiva de BrechaOferta: la brecha dice qué necesidad
+    detectada no se pudo atender con el catálogo; esto dice qué pide la gente por
+    su cuenta, incluso si no corresponde a ninguna competencia de la rúbrica.
+    Ahí es donde aparecen los temas que todavía no están en el marco.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        cols = "e.herramientas_deseadas" + (f", d.{dimension}" if dimension else "")
+        filtro = " AND e.control_ok = 1" if solo_control_ok else ""
+        filas = conn.execute(
+            f"""SELECT {cols} FROM Evaluaciones e
+                JOIN Docentes d ON d.id_docente = e.id_docente
+                WHERE e.herramientas_deseadas IS NOT NULL
+                  AND LENGTH(TRIM(e.herramientas_deseadas)) > 10{filtro}""").fetchall()
+    finally:
+        conn.close()
+    if not filas:
+        return pd.DataFrame()
+
+    # Stopwords mínimas y en español. Se deja fuera el vocabulario de relleno
+    # que aparece en toda respuesta y no distingue a un docente de otro.
+    STOP = set("""de la el los las un una unos unas y o a en con para por que se su sus
+        me mi mis lo al del es son como mas más sobre todo todos poder quiero quisiera
+        gustaria gustaría aprender saber manera forma cosas tema temas parte bien mejor
+        muy ser estar tener hacer puedo pueda sean sea desde hasta cuando donde porque
+        este esta estos estas ese esa eso nos nuestro practica práctica docente""".split())
+    def tokens(t):
+        t = re.sub(r"[^\wáéíóúñü ]", " ", str(t).lower())
+        return [w for w in t.split() if len(w) > 3 and w not in STOP]
+
+    registros = []
+    for fila in filas:
+        texto = fila[0]
+        seg = fila[1] if dimension and len(fila) > 1 else "Todos"
+        tok = tokens(texto)
+        bigramas = [" ".join(tok[i:i+2]) for i in range(len(tok)-1)]
+        for term in set(tok) | set(bigramas):
+            registros.append({"termino": term, "segmento": seg or "Sin dato"})
+    if not registros:
+        return pd.DataFrame()
+    d = pd.DataFrame(registros)
+    g = (d.groupby(["termino", "segmento"]).size().reset_index(name="menciones")
+           if dimension else
+         d.groupby("termino").size().reset_index(name="menciones"))
+    return g[g["menciones"] >= min_menciones].sort_values("menciones", ascending=False)
+
+
+def historial_docente(id_docente):
+    """Evaluaciones previas de ese docente, de la más reciente a la más antigua."""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        cols = ", ".join(COMPETENCIAS_EVALUADAS)
+        return conn.execute(
+            f"SELECT fecha_evaluacion, {cols}, control_ok FROM Evaluaciones "
+            f"WHERE id_docente = ? ORDER BY fecha_evaluacion DESC", (id_docente,)).fetchall()
+    finally:
+        conn.close()
+
 
 # NOTA: aquí vivían generar_prompt_perfil_con_contexto y
 # generar_justificacion_con_contexto. Ninguna se llamaba desde ningún lado
@@ -686,7 +1103,8 @@ def actualizar_base_de_datos_contexto():
 
 # ========== SISTEMA DE RECOMENDACIÓN DIVERSIFICADO ==========
 def recomendar_cursos_diversificado(id_docente, contexto_personal="", num_recomendaciones=5,
-                                   filtro_tiempo=None, filtro_modalidad=None):
+                                   filtro_tiempo=None, filtro_modalidad=None,
+                                   herramientas_deseadas=""):
     """
     Sistema de recomendación DIVERSIFICADO que garantiza cobertura de competencias débiles
     """
@@ -699,7 +1117,7 @@ def recomendar_cursos_diversificado(id_docente, contexto_personal="", num_recome
         
         # Obtener puntuaciones del docente
         cursor.execute(f"""
-            SELECT {', '.join(COMPETENCIAS_EVALUADAS)}, contexto_personal
+            SELECT {', '.join(COMPETENCIAS_EVALUADAS)}, contexto_personal, herramientas_deseadas
             FROM Evaluaciones 
             WHERE id_docente = ?
             ORDER BY fecha_evaluacion DESC
@@ -710,9 +1128,11 @@ def recomendar_cursos_diversificado(id_docente, contexto_personal="", num_recome
         if not result:
             return "Sin perfil registrado."
         
-        scores = result[:-1]
-        contexto_bd = result[-1] or ""
+        scores = result[:-2]
+        contexto_bd = result[-2] or ""
+        herramientas_bd = result[-1] or ""
         contexto_final = contexto_personal or contexto_bd
+        herramientas_deseadas = herramientas_deseadas or herramientas_bd
         
         # Obtener cursos con filtros
         query = """
@@ -755,23 +1175,12 @@ def recomendar_cursos_diversificado(id_docente, contexto_personal="", num_recome
         # PASO 2: ANÁLISIS DEL CONTEXTO PERSONAL
         insights_contexto = extraer_insights_contexto(contexto_final, model)
         
-        # PASO 3: GENERAR EMBEDDINGS Y SCORES BASE
-        curso_textos = []
-        for curso in cursos:
-            texto_curso = f"""
-Curso: {curso[0]}
-Descripción: {curso[2]}
-Competencias: {curso[3]}
-Modalidad: {curso[4]}
-Nivel: {curso[5]}
-Duración: {curso[1]} horas
-"""
-            curso_textos.append(texto_curso.strip())
-        
-        curso_embeddings = model.encode(curso_textos)
-        
-        # Generar perfil simplificado (MÁS FOCUSO)
-        perfil_prompt = generar_perfil_focusado(scores, contexto_final, competencias_debiles)
+        # PASO 3: EMBEDDINGS DEL CATÁLOGO (desde caché) Y SCORES BASE
+        curso_embeddings = embeddings_catalogo(cursos)
+
+        # Generar perfil del docente para compararlo contra el catálogo
+        perfil_prompt = generar_perfil_focusado(scores, contexto_final, competencias_debiles,
+                                                herramientas_deseadas)
         perfil_embedding = model.encode([perfil_prompt])[0].reshape(1, -1)
         
         # Similitudes base
@@ -865,7 +1274,13 @@ Duración: {curso[1]} horas
         
         logger.info(f"Recomendaciones diversificadas generadas: {len(recomendaciones_finales)}")
         logger.info(f"Competencias cubiertas: {len(competencias_cubiertas)}/{len(competencias_debiles)}")
-        
+
+        # Lo que antes solo se escribía en el log y se perdía: qué necesidades
+        # quedaron sin atender. Se devuelve para que quien llame pueda
+        # registrarlas en BrechaOferta.
+        st.session_state['_debiles'] = competencias_debiles
+        st.session_state['_cubiertas'] = competencias_cubiertas
+
         return recomendaciones_finales
         
     except Exception as e:
@@ -873,35 +1288,46 @@ Duración: {curso[1]} horas
         return f"Error al generar recomendaciones: {str(e)}"
 
 
-def generar_perfil_focusado(scores, contexto_personal, competencias_debiles):
-    """Genera un perfil más focuseado para mejorar la precisión de embeddings"""
-    
-    prompt_parts = ["=== PERFIL DOCENTE PARA RECOMENDACIONES ==="]
-    
-    # Contexto personal (condensado)
+def generar_perfil_focusado(scores, contexto_personal, competencias_debiles,
+                            herramientas_deseadas=""):
+    """Texto del docente que se compara contra el catálogo.
+
+    Tres decisiones deliberadas, todas por la misma razón: el modelo es un
+    sentence-transformer, entrenado con oraciones y no con fichas.
+
+    1. Sin encabezados fijos. Un '=== PERFIL DOCENTE ===' idéntico en todos los
+       perfiles acerca entre sí los vectores de docentes distintos y borra las
+       diferencias que queremos medir.
+    2. El contexto va completo. Antes se cortaba en 200 caracteres sobre un campo
+       de 600: se tiraban dos tercios de lo único que el docente escribió.
+    3. Lo que el docente dice que quiere aprender va PRIMERO. Es una declaración
+       de necesidad, más informativa para elegir un curso que el nivel que se
+       autoasignó en una rúbrica.
+    """
+    partes = []
+
+    if herramientas_deseadas and herramientas_deseadas.strip():
+        partes.append(f"Quiero aprender {herramientas_deseadas.strip()}")
+
     if contexto_personal and contexto_personal.strip():
-        prompt_parts.append(f"CONTEXTO: {contexto_personal[:200]}...")
-    
-    # Competencias prioritarias
+        partes.append(contexto_personal.strip())
+
     if competencias_debiles:
-        prompt_parts.append("COMPETENCIAS PRIORITARIAS A DESARROLLAR:")
-        for comp_info in competencias_debiles[:5]:  # Solo top 5
-            comp = comp_info['competencia']
-            titulo = RUBRICA_DATA[comp]["titulo"]
-            score = comp_info['score']
-            prompt_parts.append(f"• {titulo} (Nivel actual: {score}/4)")
-    
-    # Tags de competencias débiles
-    tags_prioritarios = []
-    for comp_info in competencias_debiles:
-        comp = comp_info['competencia']
-        tags = RUBRICA_DATA[comp]["tags"].split(', ')
-        tags_prioritarios.extend(tags)
-    
-    if tags_prioritarios:
-        prompt_parts.append(f"PALABRAS CLAVE PRIORITARIAS: {', '.join(set(tags_prioritarios))}")
-    
-    return "\n".join(prompt_parts)
+        titulos = [RUBRICA_DATA[c["competencia"]]["titulo"].split(". ", 1)[-1].lower()
+                   for c in competencias_debiles[:5]]
+        partes.append("Necesito fortalecer " + ", ".join(titulos))
+
+        # Los tags, como frase y no como lista separada por comas: el modelo
+        # embebe mejor una oración que un volcado de keywords.
+        tags = []
+        for c in competencias_debiles:
+            for t in RUBRICA_DATA[c["competencia"]]["tags"].split(", "):
+                if t not in tags:
+                    tags.append(t)
+        if tags:
+            partes.append("Me interesan temas de " + ", ".join(tags))
+
+    return ". ".join(partes) + "." if partes else "Docente de educación básica."
 
 
 def calcular_score_competencia_especifica(curso, indice, sim_base, scores, competencia_objetivo, insights_contexto):
@@ -1210,7 +1636,26 @@ def show_recommendations_page_diversificada():
     
     recomendaciones = st.session_state.get('recomendaciones', [])
     scores = st.session_state.get('scores', [])
-    
+
+    # Lectura del reactivo de control. Va arriba de todo porque condiciona cómo
+    # debe leerse el resto del perfil, no es un detalle al pie.
+    control_ok = st.session_state.get('control_ok')
+    if control_ok == 0:
+        st.warning(
+            "⚠️ **El reactivo de control no se contestó como pedía el enunciado.** "
+            "El perfil que sigue es válido como autopercepción, pero conviene "
+            "tomarlo con reserva: en instrumentos de autocalificación, fallar el "
+            "control se asocia con marcar la misma opción en todos los reactivos. "
+            "Si fue un descuido, puedes repetir el diagnóstico."
+        )
+    elif control_ok == 1:
+        st.caption("✅ Reactivo de control superado.")
+
+    n_previas = st.session_state.get('n_previas', 0)
+    if n_previas:
+        st.info(f"📈 Esta CURP tiene {n_previas} autodiagnóstico(s) anterior(es) registrado(s). "
+                "Se conservan todos para poder comparar la trayectoria.")
+
     if not isinstance(recomendaciones, list) or not recomendaciones:
         st.warning("No se encontraron recomendaciones.")
         if st.button("🔄 Realizar otro diagnóstico"):
@@ -1304,6 +1749,122 @@ def show_recommendations_page_diversificada():
             st.session_state.page = 'diagnostic'
             st.rerun()
 
+def show_brecha_page():
+    """Vista de planeación: qué necesidades formativas no cubre el catálogo."""
+    st.header("🧩 Brecha de oferta formativa")
+    st.write("Necesidades detectadas en los autodiagnósticos que el catálogo actual "
+             "no pudo atender. Es el insumo para decidir qué cursos diseñar.")
+
+    solo_ok = st.toggle(
+        "Considerar solo diagnósticos que superaron el reactivo de control",
+        value=True,
+        help="Recomendado para decisiones de presupuesto: excluye los autodiagnósticos "
+             "contestados sin leer.")
+
+    resumen = resumen_brecha(solo_control_ok=solo_ok)
+    if not resumen:
+        st.info("Todavía no hay registros de brecha. Se generan con cada autodiagnóstico "
+                "que detecte al menos una competencia débil.")
+        return
+
+    total_det = sum(r["detectada"] for r in resumen)
+    total_sin = sum(r["sin_cubrir"] for r in resumen)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Necesidades detectadas", f"{total_det:,}")
+    c2.metric("Sin cubrir", f"{total_sin:,}")
+    c3.metric("Cobertura del catálogo",
+              f"{100*(total_det-total_sin)/total_det:.0f}%" if total_det else "—")
+
+    d = pd.DataFrame(resumen)
+    d["% sin cubrir"] = (100 * d["sin_cubrir"] / d["detectada"]).round(1)
+    d = d.rename(columns={"titulo": "Competencia", "detectada": "Detectada",
+                          "sin_cubrir": "Sin cubrir", "nivel_medio": "Nivel declarado medio",
+                          "cursos_catalogo": "Cursos en catálogo"})
+
+    fig = px.bar(d.sort_values("Sin cubrir"), x="Sin cubrir", y="Competencia",
+                 orientation="h", text="Sin cubrir",
+                 title="Necesidades sin cubrir por competencia")
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=430, yaxis_title=None, xaxis_title="Docentes sin oferta")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(d[["Competencia", "Detectada", "Sin cubrir", "% sin cubrir",
+                    "Cursos en catálogo", "Nivel declarado medio"]],
+                 use_container_width=True, hide_index=True)
+
+    # Una competencia con demanda alta y catálogo vacío es una propuesta de curso
+    # nuevo. Una con catálogo amplio y demanda sin cubrir es un problema de cupo
+    # o de modalidad, no de diseño: son dos decisiones distintas.
+    disenar = d[(d["Sin cubrir"] > 0) & (d["Cursos en catálogo"] <= 2)]
+    ampliar = d[(d["Sin cubrir"] > 0) & (d["Cursos en catálogo"] > 2)]
+    if not disenar.empty:
+        st.error("**Diseñar oferta nueva** — hay demanda y el catálogo casi no tiene cursos:\n\n"
+                 + "\n".join(f"- {r['Competencia']} — {int(r['Sin cubrir'])} docentes, "
+                              f"{int(r['Cursos en catálogo'])} curso(s) en catálogo"
+                              for _, r in disenar.iterrows()))
+    if not ampliar.empty:
+        st.warning("**Revisar cupo o modalidad** — hay cursos, pero no llegaron a estos docentes:\n\n"
+                   + "\n".join(f"- {r['Competencia']} — {int(r['Sin cubrir'])} docentes, "
+                                f"{int(r['Cursos en catálogo'])} cursos disponibles"
+                                for _, r in ampliar.iterrows()))
+
+    st.subheader("Para quién hay que diseñarla")
+    dim = st.radio("Desagregar por:",
+                   ["nivel_educativo", "funcion", "contexto"],
+                   format_func=lambda x: {"nivel_educativo": "Nivel educativo",
+                                          "funcion": "Función",
+                                          "contexto": "Contexto de la escuela"}[x],
+                   horizontal=True)
+    m = brecha_por_segmento(dim, solo_control_ok=solo_ok)
+    if m.empty:
+        st.info("Aún no hay suficientes registros con ese dato capturado.")
+    else:
+        st.dataframe(m, use_container_width=True)
+        st.caption("Cada celda es el número de docentes de ese segmento cuya necesidad "
+                   "en esa competencia quedó sin atender.")
+
+    # ---- DEMANDA DECLARADA ----
+    # La brecha de arriba se calcula contra la rúbrica, así que solo puede
+    # detectar necesidades que la rúbrica ya contempla. Esto no: aquí aparece lo
+    # que los docentes piden con sus palabras, incluso si no corresponde a
+    # ninguna de las 10 competencias. Es donde se ven los temas emergentes.
+    st.markdown("---")
+    st.subheader("🧰 Lo que los docentes piden aprender, con sus palabras")
+    dd = demanda_declarada(solo_control_ok=solo_ok)
+    if dd.empty:
+        st.info("Aún no hay respuestas suficientes a la pregunta de herramientas deseadas.")
+    else:
+        top = dd.head(25)
+        fig2 = px.bar(top.sort_values("menciones"), x="menciones", y="termino",
+                      orientation="h", text="menciones",
+                      title="Términos más pedidos")
+        fig2.update_traces(textposition="outside")
+        fig2.update_layout(height=max(400, 18 * len(top)), yaxis_title=None,
+                           xaxis_title="Docentes que lo mencionan")
+        st.plotly_chart(fig2, use_container_width=True)
+
+        st.caption("Un término que aparece aquí y no corresponde a ninguna competencia "
+                   "de la rúbrica es una señal de que el marco se quedó corto, no de "
+                   "que el docente se equivocó.")
+
+        dim2 = st.selectbox("Ver por segmento:",
+                            [None, "nivel_educativo", "funcion", "contexto"],
+                            format_func=lambda x: {None: "Sin desagregar",
+                                                   "nivel_educativo": "Nivel educativo",
+                                                   "funcion": "Función",
+                                                   "contexto": "Contexto"}[x],
+                            key="sel_dim_demanda")
+        if dim2:
+            dseg = demanda_declarada(dim2, solo_control_ok=solo_ok)
+            if dseg.empty:
+                st.info("Sin suficientes menciones para desagregar.")
+            else:
+                piv = dseg.pivot_table(index="termino", columns="segmento",
+                                       values="menciones", fill_value=0, aggfunc="sum")
+                piv = piv.loc[piv.sum(axis=1).sort_values(ascending=False).index[:25]]
+                st.dataframe(piv, use_container_width=True)
+
+
 # --- INTERFAZ DE USUARIO ---
 if 'page' not in st.session_state:
     st.session_state.page = 'diagnostic'
@@ -1320,7 +1881,40 @@ def show_diagnostic_page_con_contexto():
     with st.form("rubric_form_with_context"):
         # INICIALIZAR responses AQUÍ DENTRO DEL FORMULARIO
         responses = {}
-        
+
+        # Sección 0: IDENTIFICACIÓN
+        # La CURP es lo que permite que este autodiagnóstico deje de ser anónimo
+        # y pueda unirse después con el registro de acreditación y con la
+        # encuesta de satisfacción del curso que se le recomiende.
+        st.subheader("🪪 Identificación")
+        curp_input = st.text_input(
+            "CURP",
+            max_chars=18,
+            placeholder="18 caracteres",
+            help="Se usa para guardar tu historial y para relacionar tu diagnóstico "
+                 "con los cursos que acredites. Puedes escribirla en minúsculas.",
+            key="curp_input",
+        )
+        st.caption("Se valida el formato y el dígito verificador. No se almacena ningún otro dato personal.")
+
+        # Estos tres campos son los que permiten agregar la demanda formativa por
+        # segmento. Sin ellos el registro de brecha dice "faltan cursos" pero no
+        # para quién, que es justo lo que el área necesita para planear.
+        cseg1, cseg2, cseg3 = st.columns(3)
+        with cseg1:
+            nivel_educativo = st.selectbox("Nivel educativo", NIVELES_EDUCATIVOS,
+                                           index=None, placeholder="Selecciona…",
+                                           key="sel_nivel")
+        with cseg2:
+            funcion_docente = st.selectbox("Función", FUNCIONES_DOCENTES,
+                                           index=None, placeholder="Selecciona…",
+                                           key="sel_funcion")
+        with cseg3:
+            contexto_escuela = st.selectbox("Contexto de la escuela", CONTEXTOS_ESCUELA,
+                                            index=None, placeholder="Selecciona…",
+                                            key="sel_contexto")
+        st.markdown("---")
+
         # Sección 1: Evaluación de competencias
         st.subheader("📊 Autodiagnóstico: retos de tu práctica docente")
         
@@ -1329,8 +1923,22 @@ def show_diagnostic_page_con_contexto():
         competencias_col1 = COMPETENCIAS_EVALUADAS[:5]
         competencias_col2 = COMPETENCIAS_EVALUADAS[5:]
         
+        control_respuesta = None
         with col1:
-            for key in competencias_col1:
+            for pos, key in enumerate(competencias_col1, start=1):
+                # El reactivo de control se intercala a media columna, con el
+                # mismo formato que los demás bloques para que no se distinga.
+                if pos == CONTROL_POSICION:
+                    st.subheader(CONTROL_TITULO)
+                    st.caption("🧭 Verificación de lectura del instrumento")
+                    control_respuesta = st.radio(
+                        "Selecciona tu nivel:",
+                        options=CONTROL_OPCIONES,
+                        key="radio_control",
+                        label_visibility="collapsed"
+                    )
+                    st.divider()
+
                 value = RUBRICA_DATA[key]
                 st.subheader(value["titulo"])
                 # Correspondencia con el marco que usa el DNF estatal.
@@ -1382,6 +1990,25 @@ Me gustaría aprender más sobre evaluación porque siento que solo califico ex�
             key="contexto_personal"
         )
         
+        # Sección 3: DEMANDA FORMATIVA DECLARADA
+        # Esta es la única pregunta del sistema que mira hacia adelante. Todo lo
+        # demás (rúbrica, encuesta de satisfacción) pregunta por lo que ya pasó.
+        # Es la materia prima para decidir qué cursos diseñar el próximo ciclo.
+        st.markdown("---")
+        st.subheader("🧰 ¿Qué herramientas quieres aprender?")
+        st.write("*Para mejorar tu práctica educativa. Escríbelo con tus palabras: "
+                 "de aquí salen las propuestas de cursos nuevos.*")
+        herramientas_deseadas = st.text_area(
+            label="Herramientas, métodos o temas que te gustaría dominar:",
+            placeholder="""Ejemplo: Quiero aprender a usar inteligencia artificial para planear
+mis clases, y herramientas para evaluar sin examen escrito. También me interesa
+cómo trabajar con alumnos que tienen barreras de aprendizaje en grupos grandes.""",
+            max_chars=600,
+            height=110,
+            help="No se limita al catálogo actual: justamente sirve para detectar lo que falta.",
+            key="herramientas_deseadas",
+        )
+
         # Mostrar contador de caracteres
         if contexto_personal:
             char_count = len(contexto_personal)
@@ -1399,50 +2026,89 @@ Me gustaría aprender más sobre evaluación porque siento que solo califico ex�
         
         if submitted:
             try:
+                # La CURP se valida antes que nada: sin ella no hay dónde guardar.
+                curp_ok, curp_msg = validar_curp(curp_input)
+                if not curp_ok:
+                    st.error(f"CURP: {curp_msg}")
+                    st.stop()
+                curp = curp_msg   # validar_curp devuelve la CURP ya normalizada
+
+                if not nivel_educativo or not funcion_docente:
+                    st.error("Selecciona tu nivel educativo y tu función: sin eso la "
+                             "necesidad formativa no se puede agregar por segmento.")
+                    st.stop()
+
                 # Validar datos
                 validar_datos_entrada(responses)
-                
+
                 with st.spinner("🧠 Analizando tu perfil y contexto con IA avanzada..."):
                     scores = []
                     for key in COMPETENCIAS_EVALUADAS:
                         selected = responses[key]
                         score = RUBRICA_DATA[key]["descriptores"].index(selected) + 1
                         scores.append(score)
-                    
-                    # Guardar en base de datos CON CONTEXTO
-                    id_demo = 1
+
+                    # Reactivo de control. No condiciona el envío: se registra y
+                    # se informa en los resultados para que quien lea el perfil
+                    # sepa con qué nivel de atención fue contestado.
+                    if control_respuesta is None:
+                        control_num, control_ok = None, None
+                    else:
+                        control_num = CONTROL_OPCIONES.index(control_respuesta) + 1
+                        control_ok = 1 if control_num == CONTROL_CORRECTA else 0
+
+                    # El docente se identifica por CURP, no por un id fijo.
+                    id_docente = obtener_o_crear_docente(
+                        curp, contexto_personal,
+                        nivel_educativo=nivel_educativo,
+                        funcion=funcion_docente,
+                        contexto_escuela=contexto_escuela)
+
                     conn = sqlite3.connect(DB_FILE)
                     cursor = conn.cursor()
-                    
-                    # Actualizar docente
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO Docentes 
-                        (id_docente, nombre_docente, perfil_simulado, contexto_actual)
-                        VALUES (?, ?, ?, ?)
-                    """, (id_demo, 'Docente Interactivo', 'Autodiagnóstico', contexto_personal))
-                    
-                    # Insertar evaluación con contexto
+
+                    # INSERT y no INSERT OR REPLACE: cada autodiagnóstico es un
+                    # registro nuevo, para conservar la trayectoria del docente.
                     column_names = ', '.join(COMPETENCIAS_EVALUADAS)
                     placeholders = ', '.join(['?'] * len(COMPETENCIAS_EVALUADAS))
                     sql_insert = f"""
-                        INSERT OR REPLACE INTO Evaluaciones 
-                        (id_docente, {column_names}, contexto_personal, fuente)
-                        VALUES (?, {placeholders}, ?, ?)
+                        INSERT INTO Evaluaciones
+                        (id_docente, {column_names}, contexto_personal, fuente,
+                         herramientas_deseadas, control_respuesta, control_ok)
+                        VALUES (?, {placeholders}, ?, ?, ?, ?, ?)
                     """
                     cursor.execute(sql_insert,
-                                   [id_demo] + scores + [contexto_personal, 'autopercepcion'])
-                    
+                                   [id_docente] + scores +
+                                   [contexto_personal, 'autopercepcion',
+                                    herramientas_deseadas, control_num, control_ok])
+
                     conn.commit()
                     conn.close()
-                    
+
                     # Generar recomendaciones CON CONTEXTO
                     st.session_state.recomendaciones = recomendar_cursos_diversificado(
-                        id_demo, contexto_personal, 5
+                        id_docente, contexto_personal, 5,
+                        herramientas_deseadas=herramientas_deseadas
                     )
+
+                    # Registro de brecha de oferta: qué necesidades detectó el
+                    # diagnóstico y cuáles de ellas el catálogo no pudo atender.
+                    registrar_brecha(
+                        id_docente,
+                        st.session_state.get('_debiles', []),
+                        st.session_state.get('_cubiertas', set()),
+                        control_ok=control_ok,
+                        id_evaluacion=id_evaluacion,
+                    )
+
                     st.session_state.scores = scores
+                    st.session_state.curp = curp
+                    st.session_state.id_docente = id_docente
+                    st.session_state.control_ok = control_ok
+                    st.session_state.n_previas = max(0, len(historial_docente(id_docente)) - 1)
                     st.session_state.page = 'recommendations'
                     st.rerun()
-                    
+
             except Exception as e:
                 st.error(f"Error al procesar el diagnóstico: {str(e)}")
                 logger.error(f"Error en diagnóstico con contexto: {e}")
@@ -1472,6 +2138,15 @@ def main():
         st.subheader("🔧 Herramientas")
         if st.button("🔄 Actualizar Base de Datos"):
             migrar_datos_existentes()
+
+        st.markdown("---")
+        if st.button("🧩 Brecha de oferta", use_container_width=True):
+            st.session_state.page = 'brecha'
+            st.rerun()
+        if st.session_state.get('page') == 'brecha':
+            if st.button("← Volver al diagnóstico", use_container_width=True):
+                st.session_state.page = 'diagnostic'
+                st.rerun()
         
         # Información del sistema
         st.info("""
@@ -1489,7 +2164,9 @@ def main():
     actualizar_base_de_datos_contexto()
     
     # Navegación entre páginas
-    if st.session_state.page == 'diagnostic':
+    if st.session_state.page == 'brecha':
+        show_brecha_page()
+    elif st.session_state.page == 'diagnostic':
         show_diagnostic_page_con_contexto()  # Nueva función con contexto
     else:
         show_recommendations_page_diversificada()  # Función mejorada para mostrar resultados
